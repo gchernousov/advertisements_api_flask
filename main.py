@@ -1,6 +1,8 @@
 from flask import Flask, jsonify, request
 from flask.views import MethodView
 from flask_bcrypt import Bcrypt
+import pydantic
+from typing import Type, Optional
 
 from sqlalchemy import (
     Column, Integer, String, Text, DateTime, ForeignKey, create_engine, func
@@ -12,7 +14,6 @@ from sqlalchemy.ext.declarative import declarative_base
 import os
 from dotenv import load_dotenv
 
-from validators import validate, HttpError, CreateUserScheme
 from functions import users_list, advertisements_list
 
 
@@ -32,11 +33,82 @@ Session = sessionmaker(bind=engine)
 Base = declarative_base()
 
 
+#VALIDATIONS & PERMISSIONS
+class HttpError(Exception):
+    def __init__(self, status_code: int, message: str | dict | list):
+        self.status_code = status_code
+        self.message = message
+
 @app.errorhandler(HttpError)
 def invalid_usage(error: HttpError):
     response = jsonify({'status': 'ERROR', 'message': error.message})
     response.status_code = error.status_code
     return response
+
+class CreateUserScheme(pydantic.BaseModel):
+    username: str
+    password: str
+    email: Optional[str]
+
+    @pydantic.validator('username')
+    def check_username(cls, value: str):
+        if len(value) < 3:
+            raise ValueError('username is too short')
+        if len(value) > 32:
+            raise ValueError('username is too long')
+        return value
+
+    @pydantic.validator('password')
+    def check_password(cls, value: str):
+        if len(value) < 5:
+            raise ValueError('password is too short')
+        return value
+
+class CreateAdvertisementScheme(pydantic.BaseModel):
+    title: str
+    description: str
+    id_user: int
+
+    @pydantic.validator('title')
+    def check_title(cls, value:str):
+        if value == "":
+            raise ValueError('title is empty')
+        if len(value) > 100:
+            raise ValueError('title is too long')
+        return value
+
+    @pydantic.validator('description')
+    def check_description(cls, value: str):
+        if value == "":
+            raise ValueError('description is empty')
+        return value
+
+
+def validate(val_data: dict, val_class: Type[CreateUserScheme] | Type[CreateAdvertisementScheme]):
+    try:
+        return val_class(**val_data).dict()
+    except pydantic.ValidationError as error:
+        raise HttpError(400, error.errors())
+
+def authentication(headers):
+    data = dict(headers)
+    if 'Login' in data.keys() and 'Password' in data.keys():
+        with Session() as session:
+            user = session.query(UserModel).filter(UserModel.username == data['Login']).first()
+            if user is None:
+                raise HttpError(404, 'user is not found, permission denied')
+            check = bcrypt.check_password_hash(user.password, data['Password'])
+            if check is False:
+                raise HttpError(401, 'password don\'t match, permission denied')
+    else:
+        raise HttpError(401, 'not authenticated')
+    return user.id
+
+def permission(user_id, adv_id):
+    with Session() as session:
+        advertisement = session.query(AdvertisementModel).get(adv_id)
+        if user_id != advertisement.id_user:
+            raise HttpError(403, 'it\' not your advertisement, permission denied')
 
 
 #MODELS
@@ -47,13 +119,15 @@ class UserModel(Base):
     username = Column(String(32), nullable=False, unique=True)
     password = Column(String, nullable=False)
     registration_time = Column(DateTime, server_default=func.now())
+    email = Column(String, unique=True)
     advertisements = relationship('AdvertisementModel', backref='user')
 
     @classmethod
-    def registration(cls, session: Session, username: str, password: str):
+    def registration(cls, session: Session, username: str, password: str, email: str):
         new_user = UserModel(
             username=username,
-            password=bcrypt.generate_password_hash(password)
+            password=bcrypt.generate_password_hash(password).decode('utf-8'),
+            email=email
         )
         session.add(new_user)
         try:
@@ -97,14 +171,14 @@ class UserView(MethodView):
                     raise HttpError(404, 'user is not found')
                 adv_list = advertisements_list(user.advertisements)
                 return jsonify({'username': user.username,
-                                'password': user.password,
+                                'email': user.email,
                                 'registration time': user.registration_time,
                                 'advertisements': adv_list})
 
     def post(self):
         with Session() as session:
-            new_data = validate(request.json, CreateUserScheme)
-            new_user = UserModel.registration(session, **new_data)
+            val_data = validate(request.json, CreateUserScheme)
+            new_user = UserModel.registration(session, **val_data)
             return jsonify({'status': 'new user registration successfully',
                             'user id': new_user.id})
 
@@ -116,7 +190,7 @@ class AdvertisementsView(MethodView):
             with Session() as session:
                 advertisements = session.query(AdvertisementModel).all()
                 adv_list = advertisements_list(advertisements)
-                return jsonify({'advertisements': adv_list})
+                return jsonify({'advertisements': adv_list, 'count': len(advertisements)})
         else:
             with Session() as session:
                 advertisement = session.query(AdvertisementModel).get(advert_id)
@@ -128,14 +202,20 @@ class AdvertisementsView(MethodView):
                                 'user': advertisement.id_user})
 
     def post(self):
+        new_data = request.json
+        user_id = authentication(request.headers)
+        new_data['id_user'] = user_id
         with Session() as session:
-            new_advertisement = AdvertisementModel(**request.json)
+            val_data = validate(new_data, CreateAdvertisementScheme)
+            new_advertisement = AdvertisementModel(**val_data)
             session.add(new_advertisement)
             session.commit()
             return jsonify({'status': 'new advertisement added successfully',
                             'advertisement id': new_advertisement.id})
 
     def patch(self, advert_id: int):
+        user_id = authentication(request.headers)
+        permission(user_id, advert_id)
         patch_data = request.json
         with Session() as session:
             adv = session.query(AdvertisementModel).get(advert_id)
@@ -145,6 +225,8 @@ class AdvertisementsView(MethodView):
             return jsonify({'status': 'advertisement is changed'})
 
     def delete(self, advert_id: int):
+        user_id = authentication(request.headers)
+        permission(user_id, advert_id)
         with Session() as session:
             adv = session.query(AdvertisementModel).get(advert_id)
             session.delete(adv)
@@ -163,5 +245,6 @@ app.add_url_rule('/advertisements/',
                  view_func=AdvertisementsView.as_view('advertisements'),
                  methods=['GET', 'POST'])
 
+
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run()
