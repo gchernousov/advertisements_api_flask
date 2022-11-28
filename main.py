@@ -60,6 +60,8 @@ def permission(user_id, adv_id):
     """Проверка владельца объявления"""
     with Session() as session:
         advertisement = session.query(AdvertisementModel).get(adv_id)
+        if advertisement is None:
+            raise HttpError(404, 'advertisement is not exist')
         if user_id != advertisement.id_user:
             raise HttpError(403, 'it\' not your advertisement, permission denied')
 
@@ -181,8 +183,8 @@ class AdvertisementsView(MethodView):
         user_id = authentication(request.headers)
         permission(user_id, advert_id)
         with Session() as session:
-            adv = session.query(AdvertisementModel).get(advert_id)
-            session.delete(adv)
+            advertisement = session.query(AdvertisementModel).get(advert_id)
+            session.delete(advertisement)
             session.commit()
             return jsonify({'status': 'advertisement is delete'})
 
