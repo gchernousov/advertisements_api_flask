@@ -1,8 +1,6 @@
 from flask import Flask, jsonify, request
 from flask.views import MethodView
 from flask_bcrypt import Bcrypt
-import pydantic
-from typing import Type, Optional
 
 from sqlalchemy import (
     Column, Integer, String, Text, DateTime, ForeignKey, create_engine, func
@@ -14,12 +12,14 @@ from sqlalchemy.ext.declarative import declarative_base
 import os
 from dotenv import load_dotenv
 
+from validators import HttpError, validate, CreateUserScheme, CreateAdvertisementScheme
 from functions import users_list, advertisements_list
 
 
 app = Flask('advert_app')
 bcrypt = Bcrypt(app)
 
+# environment variables
 load_dotenv()
 db_name = os.getenv('POSTGRES_DB')
 db_user = os.getenv('POSTGRES_USER')
@@ -33,85 +33,38 @@ Session = sessionmaker(bind=engine)
 Base = declarative_base()
 
 
-#VALIDATIONS & PERMISSIONS
-class HttpError(Exception):
-    def __init__(self, status_code: int, message: str | dict | list):
-        self.status_code = status_code
-        self.message = message
-
+# PERMISSIONS
 @app.errorhandler(HttpError)
 def invalid_usage(error: HttpError):
     response = jsonify({'status': 'ERROR', 'message': error.message})
     response.status_code = error.status_code
     return response
 
-class CreateUserScheme(pydantic.BaseModel):
-    username: str
-    password: str
-    email: Optional[str]
-
-    @pydantic.validator('username')
-    def check_username(cls, value: str):
-        if len(value) < 3:
-            raise ValueError('username is too short')
-        if len(value) > 32:
-            raise ValueError('username is too long')
-        return value
-
-    @pydantic.validator('password')
-    def check_password(cls, value: str):
-        if len(value) < 5:
-            raise ValueError('password is too short')
-        return value
-
-class CreateAdvertisementScheme(pydantic.BaseModel):
-    title: str
-    description: str
-    id_user: int
-
-    @pydantic.validator('title')
-    def check_title(cls, value:str):
-        if value == "":
-            raise ValueError('title is empty')
-        if len(value) > 100:
-            raise ValueError('title is too long')
-        return value
-
-    @pydantic.validator('description')
-    def check_description(cls, value: str):
-        if value == "":
-            raise ValueError('description is empty')
-        return value
-
-
-def validate(val_data: dict, val_class: Type[CreateUserScheme] | Type[CreateAdvertisementScheme]):
-    try:
-        return val_class(**val_data).dict()
-    except pydantic.ValidationError as error:
-        raise HttpError(400, error.errors())
 
 def authentication(headers):
+    """Проверка логина и пароля"""
     data = dict(headers)
     if 'Login' in data.keys() and 'Password' in data.keys():
         with Session() as session:
             user = session.query(UserModel).filter(UserModel.username == data['Login']).first()
             if user is None:
-                raise HttpError(404, 'user is not found, permission denied')
-            check = bcrypt.check_password_hash(user.password, data['Password'])
-            if check is False:
+                raise HttpError(404, 'user is not found')
+            if bcrypt.check_password_hash(user.password, data['Password']) is False:
                 raise HttpError(401, 'password don\'t match, permission denied')
     else:
         raise HttpError(401, 'not authenticated')
     return user.id
 
+
 def permission(user_id, adv_id):
+    """Проверка владельца объявления"""
     with Session() as session:
         advertisement = session.query(AdvertisementModel).get(adv_id)
         if user_id != advertisement.id_user:
             raise HttpError(403, 'it\' not your advertisement, permission denied')
 
 
-#MODELS
+# MODELS
 class UserModel(Base):
     __tablename__ = "users"
 
@@ -151,7 +104,7 @@ class AdvertisementModel(Base):
 Base.metadata.create_all(engine)
 
 
-#VIEWS
+# VIEWS
 def check():
     return jsonify({'status': 'OK'})
 
@@ -234,14 +187,14 @@ class AdvertisementsView(MethodView):
             return jsonify({'status': 'advertisement is delete'})
 
 
-#URLS
+# URLS
 app.add_url_rule('/', view_func=check, methods=['GET'])
-app.add_url_rule('/user/<int:user_id>', view_func=UserView.as_view('user_get'), methods=['GET'])
-app.add_url_rule('/user/', view_func=UserView.as_view('user_registration'), methods=['GET', 'POST'])
-app.add_url_rule('/advertisements/<int:advert_id>',
+app.add_url_rule('/user/<int:user_id>', view_func=UserView.as_view('user_detail'), methods=['GET'])
+app.add_url_rule('/user/', view_func=UserView.as_view('users'), methods=['GET', 'POST'])
+app.add_url_rule('/advertisement/<int:advert_id>',
                  view_func=AdvertisementsView.as_view('advertisement_detail'),
                  methods=['GET', 'PATCH', 'DELETE'])
-app.add_url_rule('/advertisements/',
+app.add_url_rule('/advertisement/',
                  view_func=AdvertisementsView.as_view('advertisements'),
                  methods=['GET', 'POST'])
 
